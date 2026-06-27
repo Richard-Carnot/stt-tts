@@ -44,11 +44,16 @@ import io
 import hmac
 import uuid
 import re
+import base64
 import soundfile as sf
+import requests as _http
 from dataclasses import dataclass
 from enum import Enum
 from http import HTTPStatus
 from typing import Optional
+
+from dotenv import load_dotenv
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,6 +74,24 @@ LID_MODEL_ID = os.getenv("VEXYL_STT_LID_MODEL", "onecxi/vakgyata-base")
 LID_MIN_CONFIDENCE = float(os.getenv("VEXYL_STT_LID_MIN_CONFIDENCE", "0.3"))
 LID_EN_THRESHOLD = float(os.getenv("VEXYL_STT_LID_EN_THRESHOLD", "0.85"))
 LID_SESSION_LOCK = os.getenv("VEXYL_STT_LID_SESSION_LOCK", "true").lower() in ("true", "1", "yes")
+
+# ─── Provider config ──────────────────────────────────────────────────────────
+# STT_PROVIDER=local   → use on-premise Conformer + Whisper models (default)
+# STT_PROVIDER=bhashini → use Bhashini cloud ASR; only LID model is loaded locally
+STT_PROVIDER: str = os.getenv("STT_PROVIDER", "local").lower().strip()
+
+BHASHINI_USER_ID: str            = os.getenv("BHASHINI_USER_ID", "")
+BHASHINI_API_KEY: str            = os.getenv("BHASHINI_API_KEY", "")
+BHASHINI_PIPELINE_ID: str        = os.getenv("BHASHINI_PIPELINE_ID", "64392f96daac500b55c543cd")
+BHASHINI_AUTH_TOKEN: str         = os.getenv("BHASHINI_AUTH_TOKEN", "")
+BHASHINI_INFERENCE_URL: str      = os.getenv(
+    "BHASHINI_INFERENCE_URL",
+    "https://dhruva-api.bhashini.gov.in/services/inference/pipeline",
+)
+BHASHINI_PIPELINE_CONFIG_URL: str = os.getenv(
+    "BHASHINI_PIPELINE_CONFIG_URL",
+    "https://meity-auth.ulcacontrib.org/ulca/apis/v0/model/getModelsPipeline",
+)
 
 # Audio input: 16kHz 16-bit mono PCM
 TARGET_SAMPLE_RATE = 16000
@@ -163,6 +186,11 @@ lid_processor = None
 device = None
 _infer_lock = threading.Lock()
 
+# Bhashini: ASR service IDs cached per ISO language code (fetched on first use)
+_bhashini_asr_cache: dict[str, str] = {}
+_bhashini_cache_lock = threading.Lock()
+
+
 def load_model():
     global model, en_model, en_processor, lid_model, lid_processor, device
 
@@ -170,6 +198,22 @@ def load_model():
         device = "cuda" if torch.cuda.is_available() else "cpu"
     else:
         device = DEVICE_PREF
+
+    if STT_PROVIDER == "bhashini":
+        # Skip heavy ASR models — Bhashini handles inference in the cloud.
+        # Load LID only so language auto-detection still works locally.
+        if LID_ENABLED:
+            log.info(f"[Bhashini mode] Loading LID model only: {LID_MODEL_ID} on {device}")
+            from transformers import AutoModelForAudioClassification, AutoFeatureExtractor
+            lid_model = AutoModelForAudioClassification.from_pretrained(LID_MODEL_ID)
+            lid_processor = AutoFeatureExtractor.from_pretrained(LID_MODEL_ID)
+            if device == "cuda":
+                lid_model = lid_model.cuda()
+            lid_model.eval()
+            log.info("[Bhashini mode] LID model loaded")
+        else:
+            log.info("[Bhashini mode] LID disabled — language must be specified explicitly")
+        return
 
     # ── Indic ASR (ai4bharat/indic-conformer) ──
     log.info(f"Loading ai4bharat/indic-conformer-600m-multilingual on {device}...")
@@ -450,6 +494,110 @@ async def _run_lid(pcm_float32: np.ndarray) -> tuple[str, float]:
     return await asyncio.to_thread(_run_lid_sync, pcm_float32)
 
 
+# ─── Bhashini ASR helpers ─────────────────────────────────────────────────────
+
+def _pcm_to_wav_bytes(pcm_float32: np.ndarray, sample_rate: int = TARGET_SAMPLE_RATE) -> bytes:
+    """Convert float32 PCM array to WAV bytes (16-bit PCM, mono)."""
+    buf = io.BytesIO()
+    sf.write(buf, pcm_float32, sample_rate, format="WAV", subtype="PCM_16")
+    return buf.getvalue()
+
+
+def _get_bhashini_asr_service_id(lang_code: str) -> str:
+    """
+    Return the Bhashini ASR service ID for *lang_code* (ISO 639 short code, e.g. 'hi').
+    Results are cached per language; first call hits the pipeline config API.
+    Thread-safe.
+    """
+    with _bhashini_cache_lock:
+        if lang_code in _bhashini_asr_cache:
+            return _bhashini_asr_cache[lang_code]
+
+    resp = _http.post(
+        BHASHINI_PIPELINE_CONFIG_URL,
+        headers={
+            "userID": BHASHINI_USER_ID,
+            "ulcaApiKey": BHASHINI_API_KEY,
+            "Content-Type": "application/json",
+        },
+        json={
+            "pipelineTasks": [{
+                "taskType": "asr",
+                "config": {"language": {"sourceLanguage": lang_code}},
+            }],
+            "pipelineRequestConfig": {"pipelineId": BHASHINI_PIPELINE_ID},
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    configs = data["pipelineResponseConfig"][0]["config"]
+    all_ids = [c["serviceId"] for c in configs]
+    log.info(f"[Bhashini] ASR available service IDs for '{lang_code}': {all_ids}")
+    service_id = next((sid for sid in all_ids if "ai4bharat" in sid), all_ids[0])
+
+    with _bhashini_cache_lock:
+        _bhashini_asr_cache[lang_code] = service_id
+
+    log.info(f"[Bhashini] ASR selected service ID for '{lang_code}': {service_id}")
+    return service_id
+
+
+def _bhashini_transcribe_sync(pcm_float32: np.ndarray, lang_code: str) -> str:
+    """
+    Synchronous Bhashini ASR call — intended to run in asyncio.to_thread().
+
+    1. Converts PCM float32 → WAV bytes
+    2. Base64-encodes the WAV
+    3. POSTs to Bhashini inference pipeline
+    4. Returns the transcribed text
+    """
+    wav_bytes = _pcm_to_wav_bytes(pcm_float32)
+    audio_b64 = base64.b64encode(wav_bytes).decode("utf-8")
+
+    # lang_code here is the short ISO code (e.g. 'hi', 'ml') from LANG_MAP
+    service_id = _get_bhashini_asr_service_id(lang_code)
+
+    resp = _http.post(
+        BHASHINI_INFERENCE_URL,
+        headers={
+            "Authorization": BHASHINI_AUTH_TOKEN,
+            "Content-Type": "application/json",
+        },
+        json={
+            "pipelineTasks": [{
+                "taskType": "asr",
+                "config": {
+                    "language": {"sourceLanguage": lang_code},
+                    "serviceId": service_id,
+                },
+            }],
+            "inputData": {
+                "audio": [{"audioContent": audio_b64}],
+            },
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data["pipelineResponse"][0]["output"][0]["source"]
+
+
+def _init_bhashini() -> None:
+    """Validate Bhashini credentials at startup by pre-fetching Hindi ASR service ID."""
+    if not BHASHINI_USER_ID or not BHASHINI_API_KEY:
+        log.error(
+            "[Bhashini] BHASHINI_USER_ID or BHASHINI_API_KEY not set — "
+            "Bhashini ASR will not work."
+        )
+        return
+    try:
+        _get_bhashini_asr_service_id("hi")
+        log.info("[Bhashini] Credentials validated, Hindi ASR service ID cached")
+    except Exception as exc:
+        log.error(f"[Bhashini] Startup validation failed: {exc}")
+
+
 async def transcribe(pcm_float32: np.ndarray, lang_code: str, default_lang: str = "ml-IN") -> tuple[str, str, float]:
     """Run model inference off the event loop via asyncio.to_thread().
     Routes English to Distil-Whisper, all other languages to indic-conformer.
@@ -482,7 +630,11 @@ async def transcribe(pcm_float32: np.ndarray, lang_code: str, default_lang: str 
             resolved_lang = default_lang
 
     # ASR Routing
-    if resolved_lang in ("en", "en-IN") and en_model is not None:
+    if STT_PROVIDER == "bhashini":
+        # Convert BCP-47 code to the short ISO code Bhashini expects (hi-IN → hi)
+        short_code = LANG_MAP.get(resolved_lang, resolved_lang)
+        text = await asyncio.to_thread(_bhashini_transcribe_sync, pcm_float32, short_code)
+    elif resolved_lang in ("en", "en-IN") and en_model is not None:
         text = await asyncio.to_thread(_run_english_inference, pcm_float32)
     else:
         text = await asyncio.to_thread(_run_inference, pcm_float32, resolved_lang)
@@ -1119,16 +1271,21 @@ async def main():
 
     load_model()
 
-    log.info("Running Indic warm-up inference...")
     dummy = np.zeros(16000, dtype=np.float32)
-    _run_inference(dummy, "hi")
-    log.info("Indic warm-up complete")
 
-    if EN_ENABLED and en_model is not None:
-        log.info("Running English warm-up inference...")
-        _run_english_inference(dummy)
-        log.info("English warm-up complete")
+    if STT_PROVIDER == "bhashini":
+        _init_bhashini()
+    else:
+        log.info("Running Indic warm-up inference...")
+        _run_inference(dummy, "hi")
+        log.info("Indic warm-up complete")
 
+        if EN_ENABLED and en_model is not None:
+            log.info("Running English warm-up inference...")
+            _run_english_inference(dummy)
+            log.info("English warm-up complete")
+
+    # LID warm-up runs for both providers when LID is loaded
     if LID_ENABLED and lid_model is not None:
         log.info("Running LID warm-up inference...")
         _run_lid_sync(dummy)

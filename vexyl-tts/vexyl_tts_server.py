@@ -39,12 +39,16 @@ import signal
 import threading
 import hmac
 import uuid
+import requests as _http
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
 from http import HTTPStatus
 from queue import Empty
 from typing import Optional
+
+from dotenv import load_dotenv
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,6 +70,24 @@ STREAM_PLAY_STEPS = int(os.getenv("VEXYL_TTS_STREAM_PLAY_STEPS", "40"))
 STREAMER_TIMEOUT_SECONDS = float(os.getenv("VEXYL_TTS_STREAMER_TIMEOUT", "30"))
 MODEL_ID = "ai4bharat/indic-parler-tts"
 ENABLE_TORCH_COMPILE = os.getenv("VEXYL_TTS_TORCH_COMPILE", "auto")  # auto, true, false
+
+# ─── Provider config ──────────────────────────────────────────────────────────
+# TTS_PROVIDER=local    → on-premise indic-parler-tts + Kokoro (default)
+# TTS_PROVIDER=bhashini → Bhashini cloud TTS; no local models loaded
+TTS_PROVIDER: str = os.getenv("TTS_PROVIDER", "local").lower().strip()
+
+BHASHINI_USER_ID: str            = os.getenv("BHASHINI_USER_ID", "")
+BHASHINI_API_KEY: str            = os.getenv("BHASHINI_API_KEY", "")
+BHASHINI_PIPELINE_ID: str        = os.getenv("BHASHINI_PIPELINE_ID", "64392f96daac500b55c543cd")
+BHASHINI_AUTH_TOKEN: str         = os.getenv("BHASHINI_AUTH_TOKEN", "")
+BHASHINI_INFERENCE_URL: str      = os.getenv(
+    "BHASHINI_INFERENCE_URL",
+    "https://dhruva-api.bhashini.gov.in/services/inference/pipeline",
+)
+BHASHINI_PIPELINE_CONFIG_URL: str = os.getenv(
+    "BHASHINI_PIPELINE_CONFIG_URL",
+    "https://meity-auth.ulcacontrib.org/ulca/apis/v0/model/getModelsPipeline",
+)
 
 # Batch synthesis config
 BATCH_MAX_TEXT_LENGTH = 5000          # max characters per request
@@ -222,6 +244,10 @@ tokenizer      = None
 desc_tokenizer = None
 device         = None
 
+# Bhashini: TTS service IDs cached per ISO language code
+_bhashini_tts_cache: dict[str, str] = {}
+_bhashini_tts_cache_lock = threading.Lock()
+
 # ─── LRU Cache ────────────────────────────────────────────────────────────────
 class LRUCache:
     def __init__(self, capacity):
@@ -288,6 +314,10 @@ def load_model():
             device = "cpu"
     else:
         device = DEVICE_PREF
+
+    if TTS_PROVIDER == "bhashini":
+        log.info("[Bhashini mode] Skipping local model load — synthesis handled by Bhashini cloud API")
+        return
 
     log.info(f"Loading {MODEL_ID} on {device}...")
     start = time.time()
@@ -554,8 +584,128 @@ def _synthesize_sync(text, lang_code, style="default", custom_description=None):
     audio_arr = generation.cpu().numpy().squeeze().astype(np.float32)
     return _audio_to_wav(audio_arr, model.config.sampling_rate)
 
+# ─── Bhashini TTS helpers ─────────────────────────────────────────────────────
+
+def _bcp47_to_iso(lang_code: str) -> str:
+    """Convert BCP-47 code (hi-IN) to ISO 639 short code (hi) for Bhashini."""
+    return lang_code.split("-")[0]
+
+
+def _style_to_gender(style: str) -> str:
+    """Map Vexyl voice style to Bhashini gender parameter."""
+    return "male" if style == "formal" else "female"
+
+
+def _get_bhashini_tts_service_id(lang_code: str) -> str:
+    """
+    Return the Bhashini TTS service ID for *lang_code* (ISO 639 short code).
+    Results are cached per language; first call hits the pipeline config API.
+    Thread-safe.
+    """
+    with _bhashini_tts_cache_lock:
+        if lang_code in _bhashini_tts_cache:
+            return _bhashini_tts_cache[lang_code]
+
+    resp = _http.post(
+        BHASHINI_PIPELINE_CONFIG_URL,
+        headers={
+            "userID": BHASHINI_USER_ID,
+            "ulcaApiKey": BHASHINI_API_KEY,
+            "Content-Type": "application/json",
+        },
+        json={
+            "pipelineTasks": [{
+                "taskType": "tts",
+                "config": {"language": {"sourceLanguage": lang_code}},
+            }],
+            "pipelineRequestConfig": {"pipelineId": BHASHINI_PIPELINE_ID},
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    configs = data["pipelineResponseConfig"][0]["config"]
+    all_ids = [c["serviceId"] for c in configs]
+    log.info(f"[Bhashini] TTS available service IDs for '{lang_code}': {all_ids}")
+    service_id = next((sid for sid in all_ids if "ai4bharat" in sid), all_ids[0])
+
+    with _bhashini_tts_cache_lock:
+        _bhashini_tts_cache[lang_code] = service_id
+
+    log.info(f"[Bhashini] TTS selected service ID for '{lang_code}': {service_id}")
+    return service_id
+
+
+def _bhashini_synthesize_sync(text: str, lang_code: str, style: str = "default") -> tuple[bytes, int]:
+    """
+    Synchronous Bhashini TTS call — intended to run in asyncio.to_thread().
+
+    1. Calls Bhashini inference pipeline with taskType=tts
+    2. Decodes base64 audio from the response
+    3. Normalises and returns (WAV bytes, sample_rate)
+    """
+    # Skip text that has no speakable content (numbers/punctuation only, very short)
+    import re as _re
+    if not text or not text.strip() or not _re.search(r'\w', text) or len(text.strip()) < 2:
+        raise ValueError(f"Text too short or non-speakable: {text!r}")
+
+    iso_code = _bcp47_to_iso(lang_code)
+    gender   = _style_to_gender(style)
+    service_id = _get_bhashini_tts_service_id(iso_code)
+
+    resp = _http.post(
+        BHASHINI_INFERENCE_URL,
+        headers={
+            "Authorization": BHASHINI_AUTH_TOKEN,
+            "Content-Type": "application/json",
+        },
+        json={
+            "pipelineTasks": [{
+                "taskType": "tts",
+                "config": {
+                    "language": {"sourceLanguage": iso_code},
+                    "serviceId": service_id,
+                    "gender": gender,
+                },
+            }],
+            "inputData": {
+                "input": [{"source": text}],
+                "audio": [{"audioContent": None}],
+            },
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    audio_b64: str = data["pipelineResponse"][0]["audio"][0]["audioContent"]
+    audio_bytes = base64.b64decode(audio_b64)
+
+    # Normalise to WAV (handles WAV, FLAC, OGG — whatever Bhashini returns)
+    buf = io.BytesIO(audio_bytes)
+    audio_arr, native_rate = sf.read(buf, dtype="float32")
+    return _audio_to_wav(audio_arr, native_rate)
+
+
+def _init_bhashini() -> None:
+    """Validate Bhashini credentials at startup by pre-fetching Hindi TTS service ID."""
+    if not BHASHINI_USER_ID or not BHASHINI_API_KEY:
+        log.error(
+            "[Bhashini] BHASHINI_USER_ID or BHASHINI_API_KEY not set — "
+            "Bhashini TTS will not work."
+        )
+        return
+    try:
+        _get_bhashini_tts_service_id("hi")
+        log.info("[Bhashini] Credentials validated, Hindi TTS service ID cached")
+    except Exception as exc:
+        log.error(f"[Bhashini] Startup validation failed: {exc}")
+
+
 async def synthesize_full(text, lang_code, style="default", custom_description=None):
     """Async wrapper for full synthesis."""
+    if TTS_PROVIDER == "bhashini":
+        return await asyncio.to_thread(_bhashini_synthesize_sync, text, lang_code, style)
     if _is_english(lang_code):
         return await synthesize_kokoro_full(text, style)
     return await asyncio.to_thread(_synthesize_sync, text, lang_code, style, custom_description)
@@ -704,6 +854,13 @@ def _stream_synthesize_sync(text, lang_code, style="default", custom_description
 
 async def stream_audio_chunks(text, lang_code, style="default", custom_description=None, play_steps=None):
     """Async generator yielding (chunk_bytes, sample_rate, is_final) via a queue and background thread."""
+    if TTS_PROVIDER == "bhashini":
+        # Bhashini TTS is batch-only: synthesise the full utterance and yield it
+        # as a single final chunk so the WebSocket protocol stays unchanged.
+        wav_bytes, sample_rate = await asyncio.to_thread(_bhashini_synthesize_sync, text, lang_code, style)
+        yield (wav_bytes, sample_rate, True)
+        return
+
     loop = asyncio.get_running_loop()
     queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
 
@@ -925,15 +1082,19 @@ async def _send_streaming_synthesis(
                 chunk_idx += 1
                 collected_wavs.append(wav_bytes)
             else:
-                if _is_english(lang_code):
-                    if cancel_event and cancel_event.is_set():
-                        break
-                    wav_bytes, sample_rate = await synthesize_full(sentence, lang_code, style, custom_desc)
-                else:
-                    async with _generation_semaphore:
+                try:
+                    if _is_english(lang_code):
                         if cancel_event and cancel_event.is_set():
                             break
                         wav_bytes, sample_rate = await synthesize_full(sentence, lang_code, style, custom_desc)
+                    else:
+                        async with _generation_semaphore:
+                            if cancel_event and cancel_event.is_set():
+                                break
+                            wav_bytes, sample_rate = await synthesize_full(sentence, lang_code, style, custom_desc)
+                except Exception as exc:
+                    log.warning(f"[{request_id}] Skipping sentence synthesis error: {exc} | text='{sentence[:60]}'")
+                    continue
 
                 if first_chunk_ms is None:
                     first_chunk_ms = int((time.time() - start) * 1000)
@@ -1192,8 +1353,8 @@ async def handle_connection(websocket):
     try:
         await websocket.send(json.dumps({
             "type":        "ready",
-            "model":       "indic-parler-tts",
-            "sample_rate": model.config.sampling_rate,
+            "model":       "bhashini" if TTS_PROVIDER == "bhashini" else "indic-parler-tts",
+            "sample_rate": (OUTPUT_SAMPLE_RATE or 22050) if TTS_PROVIDER == "bhashini" else model.config.sampling_rate,
             "languages":   list(LANG_MAP.keys()),
         }))
         log.info(f"New connection: {remote}")
@@ -1723,9 +1884,12 @@ async def main():
 
     load_model()
 
-    log.info("Running warm-up inference...")
-    _synthesize_sync("Hello", "en-IN", "default")
-    log.info("Warm-up complete")
+    if TTS_PROVIDER == "bhashini":
+        _init_bhashini()
+    else:
+        log.info("Running warm-up inference...")
+        _synthesize_sync("Hello", "en-IN", "default")
+        log.info("Warm-up complete")
 
     _conn_semaphore = asyncio.Semaphore(MAX_CONNECTIONS)
     _generation_semaphore = asyncio.Semaphore(MAX_ACTIVE_GENERATIONS)
